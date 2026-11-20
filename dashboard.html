@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trap the Hackers</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
+  h1 { margin-top: 0; }
+  .controls { margin-bottom: 15px; }
+  .controls select, .controls label { margin-right: 15px; }
+  .cards { display: flex; gap: 15px; margin-bottom: 20px; }
+  .card { background: #1e293b; padding: 15px; border-radius: 10px; flex: 1; text-align: center; }
+  .card b { display: block; font-size: 32px; color: #38bdf8; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .box { background: #1e293b; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
+  .box h3 { margin-top: 0; }
+  #map { height: 380px; border-radius: 8px; }
+  .row { display: flex; align-items: center; margin: 4px 0; font-size: 14px; }
+  .name { width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { background: #38bdf8; height: 14px; border-radius: 3px; }
+  .num { margin-left: 8px; }
+  #hours { display: flex; align-items: flex-end; height: 120px; gap: 3px; }
+  #hours div { background: #f472b6; flex: 1; min-width: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { padding: 6px; border-bottom: 1px solid #334155; text-align: left; }
+  #msg { color: #fbbf24; margin-bottom: 10px; }
+
+  /* Simulator panel */
+  button { padding: 9px 16px; margin: 4px 8px 4px 0; font-size: 14px; border: 0;
+           border-radius: 6px; cursor: pointer; background: #475569; color: white; }
+  #sendBatch { background: #f59e0b; color: black; }
+  #start { background: #ef4444; }
+  input[type=number] { width: 70px; padding: 6px; }
+  .simrow { margin-bottom: 8px; }
+  #simcount { margin-top: 10px; font-size: 18px; color: #38bdf8; }
+</style>
+</head>
+<body>
+
+<h1>🕸️ Trap the Hackers: Live Honeypot Dashboard</h1>
+
+<div class="controls">
+  <label>Data source:
+    <select id="source">
+      <option value="simulator">Simulator (browser)</option>
+      <option value="attempts.jsonl">Real data</option>
+      <option value="demo_attempts.jsonl">Demo data (replay)</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="auto" checked> Auto refresh (5 sec)</label>
+</div>
+
+<div class="box">
+  <h3>🤖 Attacker Simulator</h3>
+  <div class="simrow">
+    <label>Speed:
+      <select id="speed">
+        <option value="1000">Slow</option>
+        <option value="400" selected>Normal</option>
+        <option value="100">Fast</option>
+      </select>
+    </label>
+  </div>
+  <div class="simrow">
+    Sirf itne attacks bhejo:
+    <input type="number" id="batch" value="20" min="1" max="500">
+    <button id="sendBatch">📨 Send</button>
+  </div>
+  <div class="simrow">
+    Ya lagatar bhejte raho:
+    <button id="start">▶ Start</button>
+    <button id="stop">⏹ Stop</button>
+    <button id="clear">🗑 Clear (0 karo)</button>
+  </div>
+  <div id="simcount">Simulator ne bheje: 0</div>
+</div>
+
+<div id="msg"></div>
+
+<div class="cards">
+  <div class="card">Total attempts<b id="total">0</b></div>
+  <div class="card">Unique attacker IPs<b id="ips">0</b></div>
+  <div class="card">Countries<b id="countries">0</b></div>
+</div>
+
+<div class="box">
+  <h3>🌍 Attackers ka world map</h3>
+  <div id="map"></div>
+</div>
+
+<div class="grid">
+  <div class="box"><h3>Top usernames</h3><div id="users"></div></div>
+  <div class="box"><h3>Top passwords</h3><div id="pwds"></div></div>
+</div>
+
+<div class="box">
+  <h3>⏱️ Attacks per hour</h3>
+  <div id="hours"></div>
+</div>
+
+<div class="box">
+  <h3>Latest attempts</h3>
+  <table>
+    <thead><tr><th>Time</th><th>IP</th><th>Country</th><th>User</th><th>Password</th></tr></thead>
+    <tbody id="latest"></tbody>
+  </table>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+
+let map, layer;
+const geoCache = {};
+let demoShown = 0;
+const DEMO_STEP = 10;   // Demo replay: har 5 second mein kitne naye attacks
+
+// ---------- Helper functions ----------
+
+// Attacker jo likhta hai woh website mein safe dikhane ke liye
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function isPrivate(ip) {
+  return /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip) || ip === "::1";
+}
+
+// ---------- Simulator (isi page ke andar) ----------
+
+const USERS = ["root", "admin", "user", "test", "support", "ubnt", "pi", "guest", "oracle"];
+const PASSWORDS = ["123456", "admin", "password", "root", "12345",
+                   "1234", "default", "raspberry", "toor", "qwerty"];
+const PLACES = [["China", 35.8, 104.1], ["Russia", 61.5, 105.3], ["USA", 37.1, -95.7],
+                ["Brazil", -14.2, -51.9], ["India", 20.6, 78.9], ["Vietnam", 14.1, 108.3],
+                ["Germany", 51.1, 10.4], ["Nigeria", 9.1, 8.7], ["Indonesia", -0.8, 113.9],
+                ["Iran", 32.4, 53.7]];
+
+// Yeh IP ranges sirf examples ke liye reserved hain, kisi asli insaan ke nahi
+const RANGES = ["203.0.113.", "198.51.100.", "192.0.2."];
+
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// 10 fixed nakli attackers (asli bots bhi baar baar aate hain)
+const attackers = Array.from({ length: 10 }, () => {
+  const [country, lat, lon] = pick(PLACES);
+  return {
+    ip: pick(RANGES) + Math.floor(rand(1, 254)),
+    country,
+    lat: lat + rand(-4, 4),
+    lon: lon + rand(-4, 4)
+  };
+});
+
+let simData = [];      // simulator ke saare attacks yahan jama hote hain
+let simTimer = null;
+
+function useSimulator() { el("source").value = "simulator"; }
+
+function oneAttack() {
+  const a = pick(attackers);
+  simData.push({
+    time: new Date().toISOString(),
+    ip: a.ip,
+    user: pick(USERS),
+    password: pick(PASSWORDS),
+    country: a.country,
+    lat: a.lat,
+    lon: a.lon
+  });
+  if (simData.length > 2000) simData.shift();
+  el("simcount").textContent = "Simulator ne bheje: " + simData.length;
+  if (el("source").value === "simulator") safeRefresh();   // turant dashboard update
+}
+
+function stopSim() {
+  if (simTimer) { clearInterval(simTimer); simTimer = null; }
+}
+
+function startSim() {
+  useSimulator();
+  stopSim();
+  simTimer = setInterval(oneAttack, Number(el("speed").value));
+}
+
+function sendBatch() {
+  useSimulator();
+  stopSim();
+  let n = parseInt(el("batch").value, 10);
+  if (!n || n < 1) return;
+  n = Math.min(n, 500);
+  let done = 0;
+  simTimer = setInterval(() => {
+    oneAttack();
+    done++;
+    if (done >= n) stopSim();     // exact itne bhejke ruk jao
+  }, Number(el("speed").value));
+}
+
+el("sendBatch").onclick = sendBatch;
+el("start").onclick = startSim;
+el("stop").onclick = stopSim;
+el("clear").onclick = () => {
+  stopSim();
+  simData = [];
+  el("simcount").textContent = "Simulator ne bheje: 0";
+  if (el("source").value === "simulator") safeRefresh();
+};
+
+// ---------- Data load karna ----------
+
+async function loadLogs(file) {
+  if (file === "simulator") return simData.slice();
+
+  try {
+    const r = await fetch(file + "?t=" + Date.now());
+    if (!r.ok) return [];
+    const text = await r.text();
+    const rows = [];
+    text.split("\n").forEach(line => {
+      if (!line.trim()) return;
+      try { rows.push(JSON.parse(line)); } catch (e) {}
+    });
+    return rows;
+  } catch (e) {
+    return [];
+  }
+}
+
+// Asli public IP ki country/location nikalo (free ip-api.com, internet chahiye)
+async function addLocation(rows) {
+  const todo = [...new Set(
+    rows.filter(r => r.lat === undefined && !isPrivate(r.ip) && !(r.ip in geoCache))
+        .map(r => r.ip)
+  )].slice(0, 30);
+
+  await Promise.all(todo.map(async ip => {
+    try {
+      const res = await fetch("http://ip-api.com/json/" + ip + "?fields=status,country,lat,lon");
+      const g = await res.json();
+      geoCache[ip] = g.status === "success" ? g : null;
+    } catch (e) {
+      geoCache[ip] = null;
+    }
+  }));
+
+  rows.forEach(r => {
+    if (r.lat === undefined && geoCache[r.ip]) {
+      r.country = geoCache[r.ip].country;
+      r.lat = geoCache[r.ip].lat;
+      r.lon = geoCache[r.ip].lon;
+    }
+  });
+}
+
+// ---------- Dashboard draw karna ----------
+
+function topN(rows, key, n = 10) {
+  const c = {};
+  rows.forEach(r => { c[r[key]] = (c[r[key]] || 0) + 1; });
+  return Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+
+function drawBars(id, items) {
+  const max = items.length ? items[0][1] : 1;
+  el(id).innerHTML = items.map(([name, n]) =>
+    `<div class="row">
+       <span class="name" title="${esc(name)}">${esc(name)}</span>
+       <div class="bar" style="width:${(n / max) * 60}%"></div>
+       <span class="num">${n}</span>
+     </div>`).join("");
+}
+
+function drawHours(rows) {
+  const c = {};
+  rows.forEach(r => {
+    const k = new Date(r.time).toISOString().slice(0, 13);
+    c[k] = (c[k] || 0) + 1;
+  });
+  const keys = Object.keys(c).sort();
+  const max = Math.max(1, ...Object.values(c));
+  el("hours").innerHTML = keys.map(k =>
+    `<div title="${k}:00 UTC - ${c[k]} attempts" style="height:${(c[k] / max) * 100}%"></div>`
+  ).join("");
+}
+
+function drawMap(rows) {
+  if (typeof L === "undefined") {
+    el("map").textContent = "Map ke liye internet chahiye (Leaflet load nahi hua).";
+    return;
+  }
+  if (!map) {
+    map = L.map("map").setView([20, 0], 2);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      { attribution: "© OpenStreetMap" }).addTo(map);
+    layer = L.layerGroup().addTo(map);
+  }
+  layer.clearLayers();
+
+  const pts = {};
+  rows.filter(r => r.lat != null && r.lon != null).forEach(r => {
+    if (!pts[r.ip]) pts[r.ip] = { ...r, n: 0 };
+    pts[r.ip].n++;
+  });
+
+  Object.values(pts).forEach(p => {
+    L.circleMarker([p.lat, p.lon], {
+      radius: Math.min(5 + p.n / 2, 20), color: "#ef4444", fillOpacity: 0.6
+    }).bindPopup(`${esc(p.country)}<br>${esc(p.ip)}<br>${p.n} attempts`).addTo(layer);
+  });
+}
+
+async function refresh() {
+  const file = el("source").value;
+  let rows = (await loadLogs(file)).filter(r => !isNaN(new Date(r.time)));
+
+  // Demo data: dheere dheere badhta hua replay
+  if (file === "demo_attempts.jsonl") {
+    rows.sort((a, b) => new Date(a.time) - new Date(b.time));
+    demoShown = Math.min(demoShown + DEMO_STEP, rows.length);
+    rows = rows.slice(0, demoShown);
+  }
+
+  el("msg").textContent = rows.length ? "" :
+    (file === "simulator"
+      ? "Abhi 0 attacks. Upar Simulator mein Send ya Start dabao."
+      : "Abhi koi attack nahi aaya. honeypot.py / attacker_simulator.py chalao, ya Demo data chuno.");
+
+  await addLocation(rows);
+
+  el("total").textContent = rows.length;
+  el("ips").textContent = new Set(rows.map(r => r.ip)).size;
+  el("countries").textContent = new Set(rows.map(r => r.country).filter(Boolean)).size;
+
+  drawBars("users", topN(rows, "user"));
+  drawBars("pwds", topN(rows, "password"));
+  drawHours(rows);
+  drawMap(rows);
+
+  const latest = [...rows].sort((a, b) => new Date(b.time) - new Date(a.time)).slice(0, 15);
+  el("latest").innerHTML = latest.map(r =>
+    `<tr><td>${esc(new Date(r.time).toLocaleString())}</td><td>${esc(r.ip)}</td>
+     <td>${esc(r.country || "-")}</td><td>${esc(r.user)}</td><td>${esc(r.password)}</td></tr>`
+  ).join("");
+}
+
+let busy = false, again = false;
+async function safeRefresh() {
+  if (busy) { again = true; return; }   // beech mein naya data aaya to baad mein dobara chalao
+  busy = true;
+  try { await refresh(); } finally { busy = false; }
+  if (again) { again = false; safeRefresh(); }
+}
+
+// ---------- Start ----------
+
+el("source").addEventListener("change", () => {
+  demoShown = 0;      // Demo data chuno to dobara 0 se shuru ho
+  safeRefresh();
+});
+
+safeRefresh();
+
+// Real data aur Demo ke liye har 5 second mein refresh (Simulator turant update hota hai)
+setInterval(() => {
+  if (el("auto").checked && el("source").value !== "simulator") safeRefresh();
+}, 5000);
+</script>
+
+</body>
+</html>
